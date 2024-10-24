@@ -1,8 +1,25 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gorilla/mux"
+	"github.com/shaj13/raft"
+	"github.com/shaj13/raft/transport"
+	"github.com/shaj13/raft/transport/raftgrpc"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -13,4 +30,200 @@ func main() {
 	flag.Parse()
 
 	fmt.Printf("parsed flags: %s %s %s %s", *addr, *join, *api, *state)
+
+	router := mux.NewRouter()
+	router.HandleFunc("/", http.HandlerFunc(save)).Methods("POST")
+	router.HandleFunc("/{key}", http.HandlerFunc(get)).Methods("GET")
+	router.HandleFunc("/nodes", http.HandlerFunc(nodes)).Methods("GET")
+	router.HandleFunc("/nodes/{id}", http.HandlerFunc(removeNode)).Methods("DELETE")
+
+	var (
+		opts      []raft.Option
+		startOpts []raft.StartOption
+	)
+
+	startOpts = append(startOpts, raft.WithAddress(*addr))
+	opts = append(opts, raft.WithStateDIR(*state))
+	if *join != "" {
+		opt := raft.WithFallback(
+			raft.WithJoin(*join, time.Second),
+			raft.WithRestart(),
+		)
+		startOpts = append(startOpts, opt)
+	} else {
+		opt := raft.WithFallback(
+			raft.WithInitCluster(),
+			raft.WithRestart(),
+		)
+		startOpts = append(startOpts, opt)
+	}
+
+	raftgrpc.Register(
+		raftgrpc.WithDialOptions(grpc.WithInsecure()),
+	)
+	fsm = newStateMachine()
+	node = raft.NewNode(fsm, transport.GRPC, opts...)
+	raftServer := grpc.NewServer()
+	raftgrpc.RegisterHandler(raftServer, node.Handler())
+
+	go func() {
+		lis, err := net.Listen("tcp", *addr)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		err = raftServer.Serve(lis)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	go func() {
+		err := node.Start(startOpts...)
+		if err != nil && err != raft.ErrNodeStopped {
+			log.Fatal(err)
+		}
+	}()
+
+	if err := http.ListenAndServe(*api, router); err != nil {
+		log.Fatal(err)
+	}
+}
+
+var (
+	node *raft.Node
+	fsm  *stateMachine
+)
+
+func get(w http.ResponseWriter, r *http.Request) {
+	key := mux.Vars(r)["key"]
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+
+	if err := node.LinearizableRead(ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	value := fsm.Read(key)
+	w.Write([]byte(value))
+	w.Write([]byte{'\n'})
+}
+
+func nodes(w http.ResponseWriter, r *http.Request) {
+	raws := []raft.RawMember{}
+	membs := node.Members()
+	for _, m := range membs {
+		raws = append(raws, m.Raw())
+	}
+
+	buf, err := json.Marshal(raws)
+	if err != nil {
+		panic(err)
+	}
+
+	w.Write(buf)
+	w.Write([]byte{'\n'})
+}
+
+func removeNode(w http.ResponseWriter, r *http.Request) {
+	sid := mux.Vars(r)["id"]
+	id, err := strconv.ParseUint(sid, 0, 64)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+
+	if err := node.RemoveMember(ctx, id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+}
+
+func save(w http.ResponseWriter, r *http.Request) {
+	buf, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	if err := json.Unmarshal(buf, new(entry)); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+	defer cancel()
+
+	if err := node.Replicate(ctx, buf); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func newStateMachine() *stateMachine {
+	return &stateMachine{
+		kv: make(map[string]string),
+	}
+}
+
+type stateMachine struct {
+	mu sync.Mutex
+	kv map[string]string
+}
+
+func (s *stateMachine) Apply(data []byte) {
+	var e entry
+	if err := json.Unmarshal(data, &e); err != nil {
+		log.Println("unable to Unmarshal entry", err)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.kv[e.Key] = e.Value
+}
+
+func (s *stateMachine) Snapshot() (io.ReadCloser, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	buf, err := json.Marshal(&s.kv)
+	if err != nil {
+		return nil, err
+	}
+	return io.NopCloser(strings.NewReader(string(buf))), nil
+}
+
+func (s *stateMachine) Restore(r io.ReadCloser) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	buf, err := ioutil.ReadAll(r)
+	if err != nil {
+		return err
+	}
+
+	err = json.Unmarshal(buf, &s.kv)
+	if err != nil {
+		return err
+	}
+
+	return r.Close()
+}
+
+func (s *stateMachine) Read(key string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.kv[key]
+}
+
+type entry struct {
+	Key   string
+	Value string
 }
